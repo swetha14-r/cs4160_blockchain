@@ -188,16 +188,15 @@ class Lab3BlockchainCommunity(Community):
     def local_key(self) -> bytes:
         return self.my_peer.public_key.key_to_bin()
 
-    def configure(self, member_keys: list[bytes]):
+    def configure(self, member_keys: list[bytes], mining_delay: float = 0.0, timestamp_lie=None):
         self.member_keys = member_keys
+        self.miner.delay = mining_delay
+        self.miner.timestamp_lie = timestamp_lie
         if self.local_key not in self.member_keys:
             raise RuntimeError(f"My key is not in MEMBER_KEYS_HEX:\n  {self.local_key.hex()}")
         self.register_anonymous_task(
             "mining_loop",
-            self.miner.mining_loop,
-            self.chain,
-            self.mempool,
-            self,
+            self.mine_after_teammates_connect,
             ignore=(Exception,),
         )
 
@@ -208,6 +207,21 @@ class Lab3BlockchainCommunity(Community):
             if p.public_key.key_to_bin() in self.member_keys
             and p.public_key.key_to_bin() not in (self.local_key, exclude_key)
         ]
+
+    async def mine_after_teammates_connect(self):
+        expected = set(self.member_keys) - {self.local_key}
+        last_missing = None
+        while True:
+            connected = {peer.public_key.key_to_bin() for peer in self.teammates()}
+            missing = expected - connected
+            if not missing:
+                break
+            if missing != last_missing:
+                LOG.info("Waiting for teammate keys: %s", ", ".join(key.hex() for key in sorted(missing)))
+                last_missing = missing
+            await asyncio.sleep(1)
+        LOG.info("All %d teammates connected; starting mining", len(expected))
+        await self.miner.mining_loop(self.chain, self.mempool, self)
 
     def send_submit_response(self, peer, success: bool, txh: bytes, message: str):
         self.ez_send(peer, SubmitTransactionResponsePayload(success, txh, message))
@@ -309,9 +323,12 @@ class Lab3BlockchainCommunity(Community):
         except ValueError as exc:
             LOG.warning("Ignoring malformed block from %s: %s", peer.address, exc)
             return
+        print(f"Received block {block.height} from {peer.address}: timestamp={block.timestamp}")
         await self.apply_received_block(peer, block, rebroadcast=True)
 
     async def apply_received_block(self, peer, block: Block, rebroadcast: bool):
+        if block.hash in self.chain._by_hash:
+            return
         accepted = await self.miner.on_block_received(self.chain, block, peer, self.mempool, self)
         if accepted and rebroadcast:
             self.broadcast_block(block, exclude=peer)
@@ -364,8 +381,15 @@ def parse_args():
     parser.add_argument("--member-key", action="append", type=parse_hex, default=None)
     parser.add_argument("--no-register", action="store_true")
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--mining-delay", type=float, default=0.0,
+                        help="seconds to wait before each mining attempt")
+    parser.add_argument("--lie", choices=["forward", "backward"],
+                        help="mine using a dishonest timestamp")
     parser.add_argument("--log-level", default="INFO", choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"])
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mining_delay < 0:
+        parser.error("--mining-delay must be non-negative")
+    return args
 
 
 def build_ipv8(args) -> IPv8:
@@ -396,7 +420,7 @@ async def async_main():
     reg_community = next(o for o in ipv8.overlays if isinstance(o, Lab3RegistrationCommunity))
     chain_community = next(o for o in ipv8.overlays if isinstance(o, Lab3BlockchainCommunity))
     try:
-        chain_community.configure(member_keys)
+        chain_community.configure(member_keys, args.mining_delay, args.lie)
         print(f"local_public_key={chain_community.local_key.hex()}")
         print(f"blockchain_community_id={chain_community.community_id.hex()}")
         if not args.no_register:

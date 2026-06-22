@@ -14,10 +14,17 @@ BLOCKCHAIN_COMMUNITY_ID: bytes = b"Lab3_3f66c2c14924eab"
 assert len(BLOCKCHAIN_COMMUNITY_ID) == 20
 
 # Leading zero bits every mined block must satisfy
-DEFAULT_DIFFICULTY: int = 12
+DEFAULT_DIFFICULTY: int = 19
 
 # Timestamp derived from group ID: int("3f66c2c14924eab2", 16) % 10**9 = 425579698
 GENESIS_TIMESTAMP: int = 425579698
+
+TARGET_BLOCK_TIME = 10  # target seconds per block
+VOTE_WINDOW       = 5   # how many recent blocks vote
+VOTE_THRESHOLD    = 4   # votes needed to move difficulty (majority survives one liar)
+DEAD_BAND_FACTOR  = 2   # only vote if >2x slow or <0.5x fast
+MTP_WINDOW        = 11  # blocks used for median-time-past
+FUTURE_TIME_LIMIT = 60  # max seconds a block timestamp may exceed wall clock
 
 
 # 1. Header packing
@@ -207,13 +214,23 @@ def mine_block(
     height: int,
     prev_hash: bytes,
     tx_hash_list: List[bytes],
-    difficulty: int = DEFAULT_DIFFICULTY,
+    chain: Chain,
     start_nonce: int = 0,
+    timestamp_lie: Optional[str] = None,
 ) -> Block:
     """Search for a nonce that satisfies `difficulty` leading zero bits."""
+    tip = chain.tip
     body_commitment = txs_hash(tx_hash_list)
-    timestamp = int(time.time())
+    difficulty = chain.compute_next_difficulty()
+    mtp_floor  = median_time_past(tip, chain._by_hash) + 1
+    timestamp  = max(int(time.time()), mtp_floor)
+    if timestamp_lie == "forward":
+        timestamp += FUTURE_TIME_LIMIT * 2
+    elif timestamp_lie == "backward":
+        timestamp = mtp_floor - FUTURE_TIME_LIMIT * 2
     nonce = start_nonce
+
+    print(f"Mining block at height {height} with difficulty {difficulty} ...")
 
     while True:
         hdr = pack_header(prev_hash, body_commitment, timestamp, difficulty, nonce)
@@ -256,6 +273,21 @@ def _build_genesis() -> Block:
                 tx_hashes=[],
             )
         nonce += 1
+
+# 7. Compute median time past
+
+def median_time_past(parent, hash_list):
+    """Median of timestamps from `parent` walking back up to MTP_WINDOW blocks.
+    A single liar's timestamp is at most 1 of 11, so the median ignores it."""
+    timestamps = []
+    cursor = parent
+    for _ in range(min(MTP_WINDOW, parent.height + 1)):
+        timestamps.append(cursor.timestamp)
+        cursor = hash_list.get(cursor.prev_hash)
+        if cursor is None:
+            break
+    timestamps.sort()
+    return timestamps[len(timestamps) // 2]
 
 
 GENESIS: Block = _build_genesis()
@@ -300,7 +332,7 @@ class Chain:
         """Return the canonical block at height h (walks back from tip)."""
         return self._canonical_at(h)
 
-    def try_append(self, block: Block) -> tuple[bool, str]:
+    def try_append(self, block: Block, validate_timestamp: bool = True) -> tuple[bool, str]:
         """Validate and store a block. Returns (True, "") on success."""
         if block.hash in self._by_hash:
             return True, "already known"
@@ -320,6 +352,17 @@ class Chain:
 
         if block.height != parent.height + 1:
             return False, f"height {block.height} does not follow parent {parent.height}"
+
+        if validate_timestamp:
+            parent_mtp = median_time_past(parent, self._by_hash)
+            if block.timestamp <= parent_mtp:
+                return False, f"timestamp {block.timestamp} <= parent MTP {parent_mtp}"
+            if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+                return False, f"timestamp {block.timestamp} more than {FUTURE_TIME_LIMIT}s in the future"
+
+        difficulty = self.compute_next_difficulty(parent)
+        if block.difficulty != difficulty:
+            return False, f"difficulty {block.difficulty} does not match expected {difficulty}"
 
         self._store(block)
         if block.height > self._tip.height:
@@ -382,6 +425,13 @@ class Chain:
                 return False, f"block {block.height} invalid: {reason}"
             if block.prev_hash != tip.hash or block.height != tip.height + 1:
                 return False, f"block {block.height}: suffix link mismatch"
+            tip_mtp = median_time_past(tip, new_by_hash)
+            if block.timestamp <= tip_mtp:
+                return False, f"block {block.height}: timestamp {block.timestamp} <= parent MTP {tip_mtp}"
+            if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+                return False, f"block {block.height}: timestamp {block.timestamp} too far in the future"
+            if block.difficulty != self.compute_next_difficulty(tip, new_by_hash):
+                return False, f"block {block.height}: difficulty mismatch"
             new_by_hash[block.hash] = block
             new_by_height.setdefault(block.height, []).append(block)
             tip = block
@@ -406,6 +456,45 @@ class Chain:
                 return None
             block = parent
         return block if block.height == target_height else None
+
+    def compute_next_difficulty(self, tip=None, hash_list=None) -> int:
+        tip = self.tip if tip is None else tip
+        hash_list = self._by_hash if hash_list is None else hash_list
+
+        if tip.height < VOTE_WINDOW + 1:
+            return DEFAULT_DIFFICULTY
+
+        T = TARGET_BLOCK_TIME
+
+        blocks = [tip]
+        cursor = tip
+        for _ in range(VOTE_WINDOW):
+            cursor = hash_list.get(cursor.prev_hash)
+            if cursor is None:
+                return DEFAULT_DIFFICULTY
+            blocks.append(cursor)
+        blocks.reverse()
+
+        solvetimes = []
+        for i in range(1, len(blocks)):
+            raw = blocks[i].timestamp - blocks[i - 1].timestamp
+            clamped = max(1, min(raw, 6 * T))
+            if raw != clamped:
+                print(f"Timestamp delta clamped: {blocks[i - 1].timestamp} -> "
+                      f"{blocks[i].timestamp} ({raw}s -> {clamped}s)")
+            solvetimes.append(clamped)
+
+        slow = sum(1 for s in solvetimes if s > T * DEAD_BAND_FACTOR)
+        fast = sum(1 for s in solvetimes if s < T / DEAD_BAND_FACTOR)
+
+        # Net balance: each liar block adds exactly +1 slow and +1 fast, so
+        # their contributions always cancel in (slow - fast). Honest signal
+        # dominates regardless of how many blocks a single liar mines.
+        if slow - fast >= VOTE_THRESHOLD:
+            return max(1, tip.difficulty - 1)
+        if fast - slow >= VOTE_THRESHOLD:
+            return tip.difficulty + 1
+        return tip.difficulty
 
 
 
@@ -440,15 +529,14 @@ if __name__ == "__main__":
 
     # mine block 1
     print("Mining block 1 ...")
-    b1 = mine_block(1, g.hash, [], DEFAULT_DIFFICULTY)
+    chain = Chain()
+    b1 = mine_block(1, g.hash, [], chain)
     ok, reason = b1.is_valid()
     assert ok, f"Block 1 invalid: {reason}"
     print(f"Block 1 hash     : {b1.hash.hex()}")
     print(f"Block 1 nonce    : {b1.nonce}")
     print("Block 1 valid    : Yes\n")
 
-    # chain
-    chain = Chain()
     ok, msg = chain.try_append(b1)
     assert ok, f"Append failed: {msg}"
     assert chain.height == 1
@@ -460,9 +548,9 @@ if __name__ == "__main__":
     # fork test
     print("Fork test ...")
     import time as _time; _time.sleep(1)
-    b1_fork = mine_block(1, g.hash, [], DEFAULT_DIFFICULTY)
-    assert b1_fork.hash != b1.hash
     fork_chain = Chain()
+    b1_fork = mine_block(1, g.hash, [], fork_chain, start_nonce=b1.nonce + 1)
+    assert b1_fork.hash != b1.hash
     fork_chain.try_append(b1)
     ok, msg = fork_chain.try_append(b1_fork)
     assert ok, f"Fork block rejected: {msg}"
